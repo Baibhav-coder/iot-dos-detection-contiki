@@ -1,0 +1,5 @@
+build/
+*.sky
+*.o
+*.a
+*.map

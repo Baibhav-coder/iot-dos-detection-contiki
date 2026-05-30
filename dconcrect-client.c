@@ -29,7 +29,7 @@
 #define LOG_LEVEL LOG_LEVEL_INFO
 
 /* Port definitions */
-#define UDP_CLIENT_PORT 8765
+#define UDP_CLIENT_PORT 5000
 #define UDP_SERVER_PORT 5678
 
 /* Timing - matching original D-ConCReCT */

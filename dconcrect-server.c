@@ -1,17 +1,21 @@
 /*
- * D-ConCReCT Distributed Server - Ported to Contiki-NG
+ * D-ConCReCT Distributed Server - Phase 2 Enhanced
  * Original: Borgiani et al. (2021) - vspnet/ConCReCT
  * Ported by: Baibhav Chowdhury (24232033), NCI MSc Cybersecurity
  *
- * Every parent node monitors its own child nodes.
- * If a child exceeds the traffic threshold 3 times, it is muted
- * by sending a "wait" message (duty-cycle throttling).
+ * Phase 2 Enhancements:
+ *   Enhancement 1 — Adaptive Traffic Segmentation
+ *     Each child node now has 4 per-category TMN counters instead of 1.
+ *     classify_packet() assigns each packet to CAT_SENSING, CAT_EVENT,
+ *     CAT_CONTROL, or CAT_FLOOD based on UDP source port.
+ *     Reference: Hammoudeh et al. — per-type thresholds, 98.84% accuracy.
  *
- * Contiki 2.7 APIs replaced with Contiki-NG equivalents:
- *   - uip_newdata() / uip_udp_packet_send() -> simple_udp callbacks
- *   - rpl_set_root() -> NETSTACK_ROUTING.root_start()
- *   - NETSTACK_MAC.off(1) -> removed (not needed in Contiki-NG)
- *   - uip_ds6_nbr_cache -> rpl_nbr APIs
+ *   Enhancement 2 — Dynamic Threshold (warm-up phase only, this version)
+ *     Static D-ConCReCT polynomial used as seed during warm-up.
+ *     Full sliding window dynamic threshold follows in next iteration.
+ *     Reference: Raeiszadeh et al. (2024), Guo (2021), Rafiei et al. (2019).
+ *
+ * Bug fix: criaM() used undefined 'C' — corrected to NCOLS.
  */
 
 #include "contiki.h"
@@ -22,6 +26,7 @@
 #include "net/routing/rpl-lite/rpl.h"
 #include "sys/etimer.h"
 #include "sys/log.h"
+#include "traffic_classifier.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,28 +35,48 @@
 #define LOG_MODULE "DConCReCT-S"
 #define LOG_LEVEL LOG_LEVEL_INFO
 
-/* Port definitions - same as original */
+/* Port definitions */
 #define UDP_CLIENT_PORT 8765
 #define UDP_SERVER_PORT 5678
 
-/* Matrix dimensions - same as original D-ConCReCT */
-#define L 20        /* max 20 children per parent node */
-#define NCOLS 4         /* columns: [id, TMN, warnings, muted] */
+/* Matrix dimensions */
+#define L       20      /* max 20 children per parent node */
 
-/* Column index definitions - same as original */
-#define COL_ID      0
-#define COL_TMN     1   /* Traffic Measured at Node */
-#define COL_AVISO   2   /* Warning counter */
-#define COL_PENAL   3   /* Penalty/mute flag */
+/*
+ * EXTENDED MATRIX COLUMNS — Phase 2
+ *
+ * Original D-ConCReCT: MatP[20][4]
+ *   [id, TMN, warnings, muted]
+ *
+ * Phase 2 Extended: MatP[20][8]
+ *   [id, TMN_total, warnings, muted,
+ *    TMN_sensing, TMN_event, TMN_control, TMN_flood]
+ *
+ * RAM cost:
+ *   20 nodes x 8 columns x 2 bytes (int) = 320 bytes
+ *   Original was 20 x 4 x 2 = 160 bytes
+ *   Increase: +160 bytes — well within 10KB Tmote Sky RAM
+ */
+#define NCOLS   8
 
-/* Detection parameters - same as original */
+/* Column indices */
+#define COL_ID          0
+#define COL_TMN         1   /* Total TMN (all categories combined) */
+#define COL_AVISO       2   /* Warning counter */
+#define COL_PENAL       3   /* Penalty/mute flag */
+#define COL_TMN_SENSING 4   /* Per-category: sensing packets */
+#define COL_TMN_EVENT   5   /* Per-category: event/alarm packets */
+#define COL_TMN_CONTROL 6   /* Per-category: control/management packets */
+#define COL_TMN_FLOOD   7   /* Per-category: flood/unknown packets */
+
+/* Detection parameters */
 #define AVISO_MAX   3   /* max warnings before muting */
 #define PERIOD      180 /* seconds before warning reset */
 
 /* UDP connection handle */
 static struct simple_udp_connection udp_conn;
 
-/* The child monitoring matrix - core D-ConCReCT data structure */
+/* Extended child monitoring matrix */
 static int MatP[L][NCOLS];
 
 /*---------------------------------------------------------------------------*/
@@ -61,7 +86,7 @@ criaM(int Mat[L][NCOLS])
 {
   int i, j;
   for(i = 0; i < L; i++)
-    for(j = 0; j < C; j++)
+    for(j = 0; j < NCOLS; j++)   /* Bug fix: was 'C', now NCOLS */
       Mat[i][j] = 0;
 }
 
@@ -72,8 +97,12 @@ limpaM(int Mat[L][NCOLS])
 {
   int i;
   for(i = 0; i < L; i++) {
-    Mat[i][COL_AVISO] = 0;
-    Mat[i][COL_TMN]   = 0;
+    Mat[i][COL_AVISO]       = 0;
+    Mat[i][COL_TMN]         = 0;
+    Mat[i][COL_TMN_SENSING] = 0;
+    Mat[i][COL_TMN_EVENT]   = 0;
+    Mat[i][COL_TMN_CONTROL] = 0;
+    Mat[i][COL_TMN_FLOOD]   = 0;
   }
 }
 
@@ -92,28 +121,34 @@ DesmutaNo(int Mat[L][NCOLS], int id)
 }
 
 /*---------------------------------------------------------------------------*/
-/* Print current matrix state */
+/* Print current matrix state including per-category counters */
 static void
 imprimeM(int Mat[L][NCOLS])
 {
   int i;
-  LOG_INFO("--- Child Matrix ---\n");
+  LOG_INFO("--- Child Matrix (Phase 2) ---\n");
   for(i = 0; i < L; i++) {
     if(Mat[i][COL_ID] == 0) break;
-    if(Mat[i][COL_PENAL] == 1)
-      LOG_INFO("  Node %d: MUTED (suspected attacker)\n", Mat[i][COL_ID]);
-    else
-      LOG_INFO("  Node %d: Active | TMN=%d Warnings=%d\n",
-               Mat[i][COL_ID], Mat[i][COL_TMN], Mat[i][COL_AVISO]);
+    if(Mat[i][COL_PENAL] == 1) {
+      LOG_INFO("  Node %d: MUTED\n", Mat[i][COL_ID]);
+    } else {
+      LOG_INFO("  Node %d: Active | TMN=%d Warn=%d | S=%d E=%d C=%d F=%d\n",
+               Mat[i][COL_ID],
+               Mat[i][COL_TMN],
+               Mat[i][COL_AVISO],
+               Mat[i][COL_TMN_SENSING],
+               Mat[i][COL_TMN_EVENT],
+               Mat[i][COL_TMN_CONTROL],
+               Mat[i][COL_TMN_FLOOD]);
+    }
   }
 }
 
 /*---------------------------------------------------------------------------*/
 /*
  * STATIC THRESHOLD FORMULA - original D-ConCReCT polynomial
+ * Used as warm-up seed until dynamic threshold takes over (Phase 2 next step).
  * f = number of children the sender has
- * TEN = Traffic Expected at Node
- * This is what the Dynamic Threshold module will REPLACE in Phase 2.
  */
 static float
 Limitetrafego(int f)
@@ -125,11 +160,17 @@ Limitetrafego(int f)
 
 /*---------------------------------------------------------------------------*/
 /*
- * Core detection function - called for every packet received from a child.
+ * Core detection function - Phase 2 enhanced.
+ *
+ * Now accepts traffic category from classifier.
+ * Per-category TMN counter is incremented in addition to total TMN.
+ * Detection still uses total TMN against static threshold (warm-up phase).
+ * Full per-category dynamic threshold replaces this in next iteration.
+ *
  * Returns 1 if node should be muted, 0 otherwise.
  */
 static int
-consultaM(int Mat[L][NCOLS], int id, int f)
+consultaM(int Mat[L][NCOLS], int id, int f, uint8_t category)
 {
   int i;
   int TEN = (int)Limitetrafego(f + 1);
@@ -140,7 +181,9 @@ consultaM(int Mat[L][NCOLS], int id, int f)
     if(Mat[i][COL_ID] == 0) {
       Mat[i][COL_ID]  = id;
       Mat[i][COL_TMN] = 1;
-      LOG_INFO("New child registered: Node %d\n", id);
+      /* Increment per-category counter */
+      Mat[i][COL_TMN_SENSING + category] = 1;
+      LOG_INFO("New child registered: Node %d (cat=%d)\n", id, category);
       return 0;
     }
 
@@ -148,26 +191,34 @@ consultaM(int Mat[L][NCOLS], int id, int f)
     if(Mat[i][COL_ID] == id) {
       Mat[i][COL_TMN]++;
 
-      if(Mat[i][COL_TMN] > (int)TEN) {
+      /* Increment per-category counter */
+      if(category < NUM_CATEGORIES) {
+        Mat[i][COL_TMN_SENSING + category]++;
+      }
+
+      /* Log if flood category detected */
+      if(category == CAT_FLOOD) {
+        LOG_INFO("Node %d FLOOD packet | TMN_flood=%d\n",
+                 id, Mat[i][COL_TMN_FLOOD]);
+      }
+
+      if(Mat[i][COL_TMN] > TEN) {
         Mat[i][COL_AVISO]++;
 
         if(Mat[i][COL_AVISO] > AVISO_MAX) {
-          /* Threshold exceeded too many times - MUTE the node */
-          LOG_INFO("Node %d PENALISED | Warnings=%d TMN=%d\n",
-                   id, Mat[i][COL_AVISO], Mat[i][COL_TMN]);
+          LOG_INFO("Node %d PENALISED | Warnings=%d TMN=%d cat=%d\n",
+                   id, Mat[i][COL_AVISO], Mat[i][COL_TMN], category);
           Mat[i][COL_AVISO] = 0;
           Mat[i][COL_TMN]   = 0;
           Mat[i][COL_PENAL] = 1;
           return 1;
         } else {
-          /* Warning issued but not yet muted */
-          LOG_INFO("Node %d WARNING %d | TMN=%d TEN=%d\n",
-                   id, Mat[i][COL_AVISO], Mat[i][COL_TMN], TEN);
+          LOG_INFO("Node %d WARNING %d | TMN=%d TEN=%d cat=%d\n",
+                   id, Mat[i][COL_AVISO], Mat[i][COL_TMN], TEN, category);
           Mat[i][COL_TMN] = 0;
           return 0;
         }
       } else {
-        /* Traffic within threshold */
         if(Mat[i][COL_PENAL] != 1)
           Mat[i][COL_PENAL] = 0;
         return 0;
@@ -180,7 +231,7 @@ consultaM(int Mat[L][NCOLS], int id, int f)
 /*---------------------------------------------------------------------------*/
 /*
  * UDP receive callback - Contiki-NG simple_udp API
- * Replaces tcpip_handler() from original Contiki 2.7 code
+ * Phase 2: classify each packet before passing to consultaM
  */
 static void
 udp_rx_callback(struct simple_udp_connection *c,
@@ -195,6 +246,7 @@ udp_rx_callback(struct simple_udp_connection *c,
   int sender_id;
   int f = 0;
   int mute_node;
+  uint8_t category;
 
   /* Copy data safely */
   if(datalen >= sizeof(buf)) datalen = sizeof(buf) - 1;
@@ -204,26 +256,28 @@ udp_rx_callback(struct simple_udp_connection *c,
   /* Get last byte of sender IPv6 address as node ID */
   sender_id = sender_addr->u8[15];
 
-  LOG_INFO("Received '%s' from node %d\n", buf, sender_id);
+  /* PHASE 2: Classify the packet by source port */
+  category = classify_packet(sender_port, datalen);
 
-  /* Handle "awake" message - node has woken from mute */
+  LOG_INFO("Received '%s' from node %d (port=%d cat=%d)\n",
+           buf, sender_id, sender_port, category);
+
+  /* Handle "awake" message */
   if(strcmp(buf, "awake") == 0) {
     DesmutaNo(MatP, sender_id);
     return;
   }
 
-  /* Extract number of children from message prefix (e.g. "3:Nf - Hello 1") */
+  /* Extract number of children from message */
   f = atoi(buf);
 
-  /* Run detection */
-  mute_node = consultaM(MatP, sender_id, f);
+  /* Run detection with category */
+  mute_node = consultaM(MatP, sender_id, f, category);
 
   if(mute_node == 1) {
-    /* Send "wait" to throttle the offending child */
     LOG_INFO("Sending WAIT to node %d\n", sender_id);
     simple_udp_sendto(&udp_conn, "wait", 4, sender_addr);
   }
-  /* If OK, no reply needed (matches original behaviour) */
 }
 
 /*---------------------------------------------------------------------------*/
@@ -236,26 +290,20 @@ PROCESS_THREAD(udp_server_process, ev, data)
 
   PROCESS_BEGIN();
 
-  LOG_INFO("D-ConCReCT Distributed Server starting...\n");
+  LOG_INFO("D-ConCReCT Phase 2 Server starting...\n");
 
-  /* Initialise child monitoring matrix */
   criaM(MatP);
-
-  /* Start as RPL DODAG root - Contiki-NG API */
   NETSTACK_ROUTING.root_start();
 
-  /* Register UDP connection on server port */
   simple_udp_register(&udp_conn, UDP_SERVER_PORT, NULL,
                       UDP_CLIENT_PORT, udp_rx_callback);
 
-  /* Set timer to reset warnings every PERIOD seconds */
   etimer_set(&periodic_timer, PERIOD * CLOCK_SECOND);
 
   while(1) {
     PROCESS_WAIT_EVENT();
 
     if(etimer_expired(&periodic_timer)) {
-      /* Reset warning counters periodically */
       limpaM(MatP);
       LOG_INFO("Warning counters reset (period expired)\n");
       imprimeM(MatP);

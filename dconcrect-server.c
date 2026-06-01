@@ -122,7 +122,8 @@ static int consultaM(int Mat[L][NCOLS], int id, int f, uint8_t category) {
       }
       if(Mat[i][COL_TMN] > (int)TEN) {
         Mat[i][COL_AVISO]++;
-        if(Mat[i][COL_AVISO] > AVISO_MAX) {
+        int aviso_limit = (category == CAT_FLOOD) ? 3 : 10;
+        if(Mat[i][COL_AVISO] > aviso_limit) {
           LOG_INFO("Node %d PENALISED|Warnings=%d TMN=%d cat=%d\n",
                    id, Mat[i][COL_AVISO], Mat[i][COL_TMN], category);
           Mat[i][COL_AVISO] = 0;
